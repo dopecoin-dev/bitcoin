@@ -1,234 +1,330 @@
+// Copyright (c) 2011-2015 The Bitcoin Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#if defined(HAVE_CONFIG_H)
+#include "config/bitcoin-config.h"
+#endif
+
 #include "optionsdialog.h"
-#include "optionsmodel.h"
-#include "monitoreddatamapper.h"
+#include "ui_optionsdialog.h"
+
+#include "bitcoinunits.h"
 #include "guiutil.h"
+#include "optionsmodel.h"
 
-#include <QHBoxLayout>
-#include <QVBoxLayout>
-#include <QPushButton>
-#include <QListWidget>
-#include <QStackedWidget>
+#include "main.h" // for DEFAULT_SCRIPTCHECK_THREADS and MAX_SCRIPTCHECK_THREADS
+#include "netbase.h"
+#include "txdb.h" // for -dbcache defaults
 
-#include <QCheckBox>
-#include <QLabel>
-#include <QLineEdit>
+#ifdef ENABLE_WALLET
+#include "wallet/wallet.h" // for CWallet::GetRequiredFee()
+#endif
+
+#include <boost/thread.hpp>
+
+#include <QDataWidgetMapper>
+#include <QDir>
 #include <QIntValidator>
-#include <QDoubleValidator>
-#include <QRegExpValidator>
+#include <QLocale>
+#include <QMessageBox>
+#include <QTimer>
 
-/* First (currently only) page of options */
-class MainOptionsPage : public QWidget
+OptionsDialog::OptionsDialog(QWidget *parent, bool enableWallet) :
+    QDialog(parent),
+    ui(new Ui::OptionsDialog),
+    model(0),
+    mapper(0)
 {
-public:
-    explicit MainOptionsPage(QWidget *parent=0);
+    ui->setupUi(this);
 
-    void setMapper(MonitoredDataMapper *mapper);
-private:
-    QCheckBox *bitcoin_at_startup;
-    QCheckBox *minimize_to_tray;
-    QCheckBox *map_port_upnp;
-    QCheckBox *minimize_on_close;
-    QCheckBox *connect_socks4;
-    QLineEdit *proxy_ip;
-    QLineEdit *proxy_port;
-    QLineEdit *fee_edit;
+    /* Main elements init */
+    ui->databaseCache->setMinimum(nMinDbCache);
+    ui->databaseCache->setMaximum(nMaxDbCache);
+    ui->threadsScriptVerif->setMinimum(-GetNumCores());
+    ui->threadsScriptVerif->setMaximum(MAX_SCRIPTCHECK_THREADS);
 
-signals:
+    /* Network elements init */
+#ifndef USE_UPNP
+    ui->mapPortUpnp->setEnabled(false);
+#endif
 
-public slots:
+    ui->proxyIp->setEnabled(false);
+    ui->proxyPort->setEnabled(false);
+    ui->proxyPort->setValidator(new QIntValidator(1, 65535, this));
 
-};
+    ui->proxyIpTor->setEnabled(false);
+    ui->proxyPortTor->setEnabled(false);
+    ui->proxyPortTor->setValidator(new QIntValidator(1, 65535, this));
 
-OptionsDialog::OptionsDialog(QWidget *parent):
-    QDialog(parent), contents_widget(0), pages_widget(0),
-    main_options_page(0), model(0)
-{
-    contents_widget = new QListWidget();
-    contents_widget->setMaximumWidth(128);
+    connect(ui->connectSocks, SIGNAL(toggled(bool)), ui->proxyIp, SLOT(setEnabled(bool)));
+    connect(ui->connectSocks, SIGNAL(toggled(bool)), ui->proxyPort, SLOT(setEnabled(bool)));
+    connect(ui->connectSocks, SIGNAL(toggled(bool)), this, SLOT(updateProxyValidationState()));
 
-    pages_widget = new QStackedWidget();
-    pages_widget->setMinimumWidth(300);
+    connect(ui->connectSocksTor, SIGNAL(toggled(bool)), ui->proxyIpTor, SLOT(setEnabled(bool)));
+    connect(ui->connectSocksTor, SIGNAL(toggled(bool)), ui->proxyPortTor, SLOT(setEnabled(bool)));
+    connect(ui->connectSocksTor, SIGNAL(toggled(bool)), this, SLOT(updateProxyValidationState()));
 
-    QListWidgetItem *item_main = new QListWidgetItem(tr("Main"));
-    contents_widget->addItem(item_main);
-    main_options_page = new MainOptionsPage(this);
-    pages_widget->addWidget(main_options_page);
+    /* Window elements init */
+#ifdef Q_OS_MAC
+    /* remove Window tab on Mac */
+    ui->tabWidget->removeTab(ui->tabWidget->indexOf(ui->tabWindow));
+#endif
 
-    contents_widget->setCurrentRow(0);
+    /* remove Wallet tab in case of -disablewallet */
+    if (!enableWallet) {
+        ui->tabWidget->removeTab(ui->tabWidget->indexOf(ui->tabWallet));
+    }
 
-    QHBoxLayout *main_layout = new QHBoxLayout();
-    main_layout->addWidget(contents_widget);
-    main_layout->addWidget(pages_widget, 1);
+    /* Display elements init */
+    QDir translations(":translations");
+    ui->lang->addItem(QString("(") + tr("default") + QString(")"), QVariant(""));
+    Q_FOREACH(const QString &langStr, translations.entryList())
+    {
+        QLocale locale(langStr);
 
-    QVBoxLayout *layout = new QVBoxLayout();
-    layout->addLayout(main_layout);
+        /** check if the locale name consists of 2 parts (language_country) */
+        if(langStr.contains("_"))
+        {
+#if QT_VERSION >= 0x040800
+            /** display language strings as "native language - native country (locale name)", e.g. "Deutsch - Deutschland (de)" */
+            ui->lang->addItem(locale.nativeLanguageName() + QString(" - ") + locale.nativeCountryName() + QString(" (") + langStr + QString(")"), QVariant(langStr));
+#else
+            /** display language strings as "language - country (locale name)", e.g. "German - Germany (de)" */
+            ui->lang->addItem(QLocale::languageToString(locale.language()) + QString(" - ") + QLocale::countryToString(locale.country()) + QString(" (") + langStr + QString(")"), QVariant(langStr));
+#endif
+        }
+        else
+        {
+#if QT_VERSION >= 0x040800
+            /** display language strings as "native language (locale name)", e.g. "Deutsch (de)" */
+            ui->lang->addItem(locale.nativeLanguageName() + QString(" (") + langStr + QString(")"), QVariant(langStr));
+#else
+            /** display language strings as "language (locale name)", e.g. "German (de)" */
+            ui->lang->addItem(QLocale::languageToString(locale.language()) + QString(" (") + langStr + QString(")"), QVariant(langStr));
+#endif
+        }
+    }
+#if QT_VERSION >= 0x040700
+    ui->thirdPartyTxUrls->setPlaceholderText("https://example.com/tx/%s");
+#endif
 
-    QHBoxLayout *buttons = new QHBoxLayout();
-    buttons->addStretch(1);
-    QPushButton *ok_button = new QPushButton(tr("OK"));
-    buttons->addWidget(ok_button);
-    QPushButton *cancel_button = new QPushButton(tr("Cancel"));
-    buttons->addWidget(cancel_button);
-    apply_button = new QPushButton(tr("Apply"));
-    apply_button->setEnabled(false);
-    buttons->addWidget(apply_button);
-
-    layout->addLayout(buttons);
-
-    setLayout(layout);
-    setWindowTitle(tr("Options"));
+    ui->unit->setModel(new BitcoinUnits(this));
 
     /* Widget-to-option mapper */
-    mapper = new MonitoredDataMapper(this);
+    mapper = new QDataWidgetMapper(this);
     mapper->setSubmitPolicy(QDataWidgetMapper::ManualSubmit);
     mapper->setOrientation(Qt::Vertical);
-    /* enable apply button when data modified */
-    connect(mapper, SIGNAL(viewModified()), this, SLOT(enableApply()));
-    /* disable apply button when new data loaded */
-    connect(mapper, SIGNAL(currentIndexChanged(int)), this, SLOT(disableApply()));
 
-    /* Event bindings */
-    connect(ok_button, SIGNAL(clicked()), this, SLOT(okClicked()));
-    connect(cancel_button, SIGNAL(clicked()), this, SLOT(cancelClicked()));
-    connect(apply_button, SIGNAL(clicked()), this, SLOT(applyClicked()));
+    /* setup/change UI elements when proxy IPs are invalid/valid */
+    ui->proxyIp->setCheckValidator(new ProxyAddressValidator(parent));
+    ui->proxyIpTor->setCheckValidator(new ProxyAddressValidator(parent));
+    connect(ui->proxyIp, SIGNAL(validationDidChange(QValidatedLineEdit *)), this, SLOT(updateProxyValidationState()));
+    connect(ui->proxyIpTor, SIGNAL(validationDidChange(QValidatedLineEdit *)), this, SLOT(updateProxyValidationState()));
+    connect(ui->proxyPort, SIGNAL(textChanged(const QString&)), this, SLOT(updateProxyValidationState()));
+    connect(ui->proxyPortTor, SIGNAL(textChanged(const QString&)), this, SLOT(updateProxyValidationState()));
+}
+
+OptionsDialog::~OptionsDialog()
+{
+    delete ui;
 }
 
 void OptionsDialog::setModel(OptionsModel *model)
 {
     this->model = model;
 
-    mapper->setModel(model);
-    main_options_page->setMapper(mapper);
+    if(model)
+    {
+        /* check if client restart is needed and show persistent message */
+        if (model->isRestartRequired())
+            showRestartWarning(true);
 
-    mapper->toFirst();
+        QString strLabel = model->getOverriddenByCommandLine();
+        if (strLabel.isEmpty())
+            strLabel = tr("none");
+        ui->overriddenByCommandLineLabel->setText(strLabel);
+
+        mapper->setModel(model);
+        setMapper();
+        mapper->toFirst();
+
+        updateDefaultProxyNets();
+    }
+
+    /* warn when one of the following settings changes by user action (placed here so init via mapper doesn't trigger them) */
+
+    /* Main */
+    connect(ui->databaseCache, SIGNAL(valueChanged(int)), this, SLOT(showRestartWarning()));
+    connect(ui->threadsScriptVerif, SIGNAL(valueChanged(int)), this, SLOT(showRestartWarning()));
+    /* Wallet */
+    connect(ui->spendZeroConfChange, SIGNAL(clicked(bool)), this, SLOT(showRestartWarning()));
+    /* Network */
+    connect(ui->allowIncoming, SIGNAL(clicked(bool)), this, SLOT(showRestartWarning()));
+    connect(ui->connectSocks, SIGNAL(clicked(bool)), this, SLOT(showRestartWarning()));
+    connect(ui->connectSocksTor, SIGNAL(clicked(bool)), this, SLOT(showRestartWarning()));
+    /* Display */
+    connect(ui->lang, SIGNAL(valueChanged()), this, SLOT(showRestartWarning()));
+    connect(ui->thirdPartyTxUrls, SIGNAL(textChanged(const QString &)), this, SLOT(showRestartWarning()));
 }
 
-void OptionsDialog::changePage(QListWidgetItem *current, QListWidgetItem *previous)
+void OptionsDialog::setMapper()
 {
-    Q_UNUSED(previous);
-    if(current)
+    /* Main */
+    mapper->addMapping(ui->bitcoinAtStartup, OptionsModel::StartAtStartup);
+    mapper->addMapping(ui->threadsScriptVerif, OptionsModel::ThreadsScriptVerif);
+    mapper->addMapping(ui->databaseCache, OptionsModel::DatabaseCache);
+
+    /* Wallet */
+    mapper->addMapping(ui->spendZeroConfChange, OptionsModel::SpendZeroConfChange);
+    mapper->addMapping(ui->coinControlFeatures, OptionsModel::CoinControlFeatures);
+
+    /* Network */
+    mapper->addMapping(ui->mapPortUpnp, OptionsModel::MapPortUPnP);
+    mapper->addMapping(ui->allowIncoming, OptionsModel::Listen);
+
+    mapper->addMapping(ui->connectSocks, OptionsModel::ProxyUse);
+    mapper->addMapping(ui->proxyIp, OptionsModel::ProxyIP);
+    mapper->addMapping(ui->proxyPort, OptionsModel::ProxyPort);
+
+    mapper->addMapping(ui->connectSocksTor, OptionsModel::ProxyUseTor);
+    mapper->addMapping(ui->proxyIpTor, OptionsModel::ProxyIPTor);
+    mapper->addMapping(ui->proxyPortTor, OptionsModel::ProxyPortTor);
+
+    /* Window */
+#ifndef Q_OS_MAC
+    mapper->addMapping(ui->hideTrayIcon, OptionsModel::HideTrayIcon);
+    mapper->addMapping(ui->minimizeToTray, OptionsModel::MinimizeToTray);
+    mapper->addMapping(ui->minimizeOnClose, OptionsModel::MinimizeOnClose);
+#endif
+
+    /* Display */
+    mapper->addMapping(ui->lang, OptionsModel::Language);
+    mapper->addMapping(ui->unit, OptionsModel::DisplayUnit);
+    mapper->addMapping(ui->thirdPartyTxUrls, OptionsModel::ThirdPartyTxUrls);
+}
+
+void OptionsDialog::setOkButtonState(bool fState)
+{
+    ui->okButton->setEnabled(fState);
+}
+
+void OptionsDialog::on_resetButton_clicked()
+{
+    if(model)
     {
-        pages_widget->setCurrentIndex(contents_widget->row(current));
+        // confirmation dialog
+        QMessageBox::StandardButton btnRetVal = QMessageBox::question(this, tr("Confirm options reset"),
+            tr("Client restart required to activate changes.") + "<br><br>" + tr("Client will be shut down. Do you want to proceed?"),
+            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+
+        if(btnRetVal == QMessageBox::Cancel)
+            return;
+
+        /* reset all options and close GUI */
+        model->Reset();
+        QApplication::quit();
     }
 }
 
-void OptionsDialog::okClicked()
+void OptionsDialog::on_okButton_clicked()
 {
     mapper->submit();
     accept();
+    updateDefaultProxyNets();
 }
 
-void OptionsDialog::cancelClicked()
+void OptionsDialog::on_cancelButton_clicked()
 {
     reject();
 }
 
-void OptionsDialog::applyClicked()
+void OptionsDialog::on_hideTrayIcon_stateChanged(int fState)
 {
-    mapper->submit();
-    apply_button->setEnabled(false);
+    if(fState)
+    {
+        ui->minimizeToTray->setChecked(false);
+        ui->minimizeToTray->setEnabled(false);
+    }
+    else
+    {
+        ui->minimizeToTray->setEnabled(true);
+    }
 }
 
-void OptionsDialog::enableApply()
+void OptionsDialog::showRestartWarning(bool fPersistent)
 {
-    apply_button->setEnabled(true);
+    ui->statusLabel->setStyleSheet("QLabel { color: red; }");
+
+    if(fPersistent)
+    {
+        ui->statusLabel->setText(tr("Client restart required to activate changes."));
+    }
+    else
+    {
+        ui->statusLabel->setText(tr("This change would require a client restart."));
+        // clear non-persistent status label after 10 seconds
+        // Todo: should perhaps be a class attribute, if we extend the use of statusLabel
+        QTimer::singleShot(10000, this, SLOT(clearStatusLabel()));
+    }
 }
 
-void OptionsDialog::disableApply()
+void OptionsDialog::clearStatusLabel()
 {
-    apply_button->setEnabled(false);
+    ui->statusLabel->clear();
 }
 
-MainOptionsPage::MainOptionsPage(QWidget *parent):
-        QWidget(parent)
+void OptionsDialog::updateProxyValidationState()
 {
-    QVBoxLayout *layout = new QVBoxLayout();
-
-    bitcoin_at_startup = new QCheckBox(tr("&Start Bitcoin on window system startup"));
-    bitcoin_at_startup->setToolTip(tr("Automatically start Bitcoin after the computer is turned on"));
-    layout->addWidget(bitcoin_at_startup);
-
-    minimize_to_tray = new QCheckBox(tr("&Minimize to the tray instead of the taskbar"));
-    minimize_to_tray->setToolTip(tr("Show only a tray icon after minimizing the window"));
-    layout->addWidget(minimize_to_tray);
-
-    map_port_upnp = new QCheckBox(tr("Map port using &UPnP"));
-    map_port_upnp->setToolTip(tr("Automatically open the Bitcoin client port on the router. This only works when your router supports UPnP and it is enabled."));
-    layout->addWidget(map_port_upnp);
-
-    minimize_on_close = new QCheckBox(tr("M&inimize on close"));
-    minimize_on_close->setToolTip(tr("Minimize instead of exit the application when the window is closed. When this option is enabled, the application will be closed only after selecting Quit in the menu."));
-    layout->addWidget(minimize_on_close);
-
-    connect_socks4 = new QCheckBox(tr("&Connect through SOCKS4 proxy:"));
-    connect_socks4->setToolTip(tr("Connect to the Bitcon network through a SOCKS4 proxy (e.g. when connecting through Tor)"));
-    layout->addWidget(connect_socks4);
-
-    QHBoxLayout *proxy_hbox = new QHBoxLayout();
-    proxy_hbox->addSpacing(18);
-    QLabel *proxy_ip_label = new QLabel(tr("Proxy &IP: "));
-    proxy_hbox->addWidget(proxy_ip_label);
-    proxy_ip = new QLineEdit();
-    proxy_ip->setMaximumWidth(140);
-    proxy_ip->setEnabled(false);
-    proxy_ip->setValidator(new QRegExpValidator(QRegExp("[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"), this));
-    proxy_ip->setToolTip(tr("IP address of the proxy (e.g. 127.0.0.1)"));
-    proxy_ip_label->setBuddy(proxy_ip);
-    proxy_hbox->addWidget(proxy_ip);
-    QLabel *proxy_port_label = new QLabel(tr("&Port: "));
-    proxy_hbox->addWidget(proxy_port_label);
-    proxy_port = new QLineEdit();
-    proxy_port->setMaximumWidth(55);
-    proxy_port->setValidator(new QIntValidator(0, 65535, this));
-    proxy_port->setEnabled(false);
-    proxy_port->setToolTip(tr("Port of the proxy (e.g. 1234)"));
-    proxy_port_label->setBuddy(proxy_port);
-    proxy_hbox->addWidget(proxy_port);
-    proxy_hbox->addStretch(1);
-
-    layout->addLayout(proxy_hbox);
-    QLabel *fee_help = new QLabel(tr("Optional transaction fee per KB that helps make sure your transactions are processed quickly.  Most transactions are 1KB.  Fee 0.01 recommended."));
-    fee_help->setWordWrap(true);
-    layout->addWidget(fee_help);
-
-    QHBoxLayout *fee_hbox = new QHBoxLayout();
-    fee_hbox->addSpacing(18);
-    QLabel *fee_label = new QLabel(tr("Pay transaction &fee"));
-    fee_hbox->addWidget(fee_label);
-    fee_edit = new QLineEdit();
-    fee_edit->setMaximumWidth(100);
-    fee_edit->setToolTip(tr("Optional transaction fee per KB that helps make sure your transactions are processed quickly. Most transactions are 1KB. Fee 0.01 recommended."));
-
-    GUIUtil::setupAmountWidget(fee_edit, this);
-
-    fee_label->setBuddy(fee_edit);
-    fee_hbox->addWidget(fee_edit);
-    fee_hbox->addStretch(1);
-
-    layout->addLayout(fee_hbox);
-
-    layout->addStretch(1); /* Extra space at bottom */
-
-    setLayout(layout);
-
-    connect(connect_socks4, SIGNAL(toggled(bool)), proxy_ip, SLOT(setEnabled(bool)));
-    connect(connect_socks4, SIGNAL(toggled(bool)), proxy_port, SLOT(setEnabled(bool)));
-
-#ifndef USE_UPNP
-    map_port_upnp->setDisabled(true);
-#endif
+    QValidatedLineEdit *pUiProxyIp = ui->proxyIp;
+    QValidatedLineEdit *otherProxyWidget = (pUiProxyIp == ui->proxyIpTor) ? ui->proxyIp : ui->proxyIpTor;
+    if (pUiProxyIp->isValid() && (!ui->proxyPort->isEnabled() || ui->proxyPort->text().toInt() > 0) && (!ui->proxyPortTor->isEnabled() || ui->proxyPortTor->text().toInt() > 0))
+    {
+        setOkButtonState(otherProxyWidget->isValid()); //only enable ok button if both proxys are valid
+        ui->statusLabel->clear();
+    }
+    else
+    {
+        setOkButtonState(false);
+        ui->statusLabel->setStyleSheet("QLabel { color: red; }");
+        ui->statusLabel->setText(tr("The supplied proxy address is invalid."));
+    }
 }
 
-void MainOptionsPage::setMapper(MonitoredDataMapper *mapper)
+void OptionsDialog::updateDefaultProxyNets()
 {
-    /* Map model to widgets */
-    mapper->addMapping(bitcoin_at_startup, OptionsModel::StartAtStartup);
-    mapper->addMapping(minimize_to_tray, OptionsModel::MinimizeToTray);
-    mapper->addMapping(map_port_upnp, OptionsModel::MapPortUPnP);
-    mapper->addMapping(minimize_on_close, OptionsModel::MinimizeOnClose);
-    mapper->addMapping(connect_socks4, OptionsModel::ConnectSOCKS4);
-    mapper->addMapping(proxy_ip, OptionsModel::ProxyIP);
-    mapper->addMapping(proxy_port, OptionsModel::ProxyPort);
-    mapper->addMapping(fee_edit, OptionsModel::Fee);
+    proxyType proxy;
+    std::string strProxy;
+    QString strDefaultProxyGUI;
+
+    GetProxy(NET_IPV4, proxy);
+    strProxy = proxy.proxy.ToStringIP() + ":" + proxy.proxy.ToStringPort();
+    strDefaultProxyGUI = ui->proxyIp->text() + ":" + ui->proxyPort->text();
+    (strProxy == strDefaultProxyGUI.toStdString()) ? ui->proxyReachIPv4->setChecked(true) : ui->proxyReachIPv4->setChecked(false);
+
+    GetProxy(NET_IPV6, proxy);
+    strProxy = proxy.proxy.ToStringIP() + ":" + proxy.proxy.ToStringPort();
+    strDefaultProxyGUI = ui->proxyIp->text() + ":" + ui->proxyPort->text();
+    (strProxy == strDefaultProxyGUI.toStdString()) ? ui->proxyReachIPv6->setChecked(true) : ui->proxyReachIPv6->setChecked(false);
+
+    GetProxy(NET_TOR, proxy);
+    strProxy = proxy.proxy.ToStringIP() + ":" + proxy.proxy.ToStringPort();
+    strDefaultProxyGUI = ui->proxyIp->text() + ":" + ui->proxyPort->text();
+    (strProxy == strDefaultProxyGUI.toStdString()) ? ui->proxyReachTor->setChecked(true) : ui->proxyReachTor->setChecked(false);
 }
 
+ProxyAddressValidator::ProxyAddressValidator(QObject *parent) :
+QValidator(parent)
+{
+}
+
+QValidator::State ProxyAddressValidator::validate(QString &input, int &pos) const
+{
+    Q_UNUSED(pos);
+    // Validate the proxy
+    proxyType addrProxy = proxyType(CService(input.toStdString(), 9050), true);
+    if (addrProxy.IsValid())
+        return QValidator::Acceptable;
+
+    return QValidator::Invalid;
+}

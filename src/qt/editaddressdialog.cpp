@@ -1,5 +1,10 @@
+// Copyright (c) 2011-2013 The Bitcoin Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
 #include "editaddressdialog.h"
 #include "ui_editaddressdialog.h"
+
 #include "addresstablemodel.h"
 #include "guiutil.h"
 
@@ -8,7 +13,10 @@
 
 EditAddressDialog::EditAddressDialog(Mode mode, QWidget *parent) :
     QDialog(parent),
-    ui(new Ui::EditAddressDialog), mapper(0), mode(mode), model(0)
+    ui(new Ui::EditAddressDialog),
+    mapper(0),
+    mode(mode),
+    model(0)
 {
     ui->setupUi(this);
 
@@ -25,7 +33,7 @@ EditAddressDialog::EditAddressDialog(Mode mode, QWidget *parent) :
         break;
     case EditReceivingAddress:
         setWindowTitle(tr("Edit receiving address"));
-        ui->addressEdit->setReadOnly(true);
+        ui->addressEdit->setEnabled(false);
         break;
     case EditSendingAddress:
         setWindowTitle(tr("Edit sending address"));
@@ -44,6 +52,9 @@ EditAddressDialog::~EditAddressDialog()
 void EditAddressDialog::setModel(AddressTableModel *model)
 {
     this->model = model;
+    if(!model)
+        return;
+
     mapper->setModel(model);
     mapper->addMapping(ui->labelEdit, AddressTableModel::Label);
     mapper->addMapping(ui->addressEdit, AddressTableModel::Address);
@@ -54,9 +65,11 @@ void EditAddressDialog::loadRow(int row)
     mapper->setCurrentIndex(row);
 }
 
-QString EditAddressDialog::saveCurrentRow()
+bool EditAddressDialog::saveCurrentRow()
 {
-    QString address;
+    if(!model)
+        return false;
+
     switch(mode)
     {
     case NewReceivingAddress:
@@ -65,12 +78,6 @@ QString EditAddressDialog::saveCurrentRow()
                 mode == NewSendingAddress ? AddressTableModel::Send : AddressTableModel::Receive,
                 ui->labelEdit->text(),
                 ui->addressEdit->text());
-        if(address.isEmpty())
-        {
-            QMessageBox::warning(this, windowTitle(),
-                tr("The address %1 is already in the address book.").arg(ui->addressEdit->text()),
-                QMessageBox::Ok, QMessageBox::Ok);
-        }
         break;
     case EditReceivingAddress:
     case EditSendingAddress:
@@ -80,5 +87,58 @@ QString EditAddressDialog::saveCurrentRow()
         }
         break;
     }
+    return !address.isEmpty();
+}
+
+void EditAddressDialog::accept()
+{
+    if(!model)
+        return;
+
+    if(!saveCurrentRow())
+    {
+        switch(model->getEditStatus())
+        {
+        case AddressTableModel::OK:
+            // Failed with unknown reason. Just reject.
+            break;
+        case AddressTableModel::NO_CHANGES:
+            // No changes were made during edit operation. Just reject.
+            break;
+        case AddressTableModel::INVALID_ADDRESS:
+            QMessageBox::warning(this, windowTitle(),
+                tr("The entered address \"%1\" is not a valid Bitcoin address.").arg(ui->addressEdit->text()),
+                QMessageBox::Ok, QMessageBox::Ok);
+            break;
+        case AddressTableModel::DUPLICATE_ADDRESS:
+            QMessageBox::warning(this, windowTitle(),
+                tr("The entered address \"%1\" is already in the address book.").arg(ui->addressEdit->text()),
+                QMessageBox::Ok, QMessageBox::Ok);
+            break;
+        case AddressTableModel::WALLET_UNLOCK_FAILURE:
+            QMessageBox::critical(this, windowTitle(),
+                tr("Could not unlock wallet."),
+                QMessageBox::Ok, QMessageBox::Ok);
+            break;
+        case AddressTableModel::KEY_GENERATION_FAILURE:
+            QMessageBox::critical(this, windowTitle(),
+                tr("New key generation failed."),
+                QMessageBox::Ok, QMessageBox::Ok);
+            break;
+
+        }
+        return;
+    }
+    QDialog::accept();
+}
+
+QString EditAddressDialog::getAddress() const
+{
     return address;
+}
+
+void EditAddressDialog::setAddress(const QString &address)
+{
+    this->address = address;
+    ui->addressEdit->setText(address);
 }

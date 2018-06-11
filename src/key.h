@@ -1,175 +1,200 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Distributed under the MIT/X11 software license, see the accompanying
-// file license.txt or http://www.opensource.org/licenses/mit-license.php.
+// Copyright (c) 2009-2015 The Bitcoin Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
 #ifndef BITCOIN_KEY_H
 #define BITCOIN_KEY_H
 
-#include <openssl/ec.h>
-#include <openssl/ecdsa.h>
-#include <openssl/obj_mac.h>
+#include "pubkey.h"
+#include "serialize.h"
+#include "support/allocators/secure.h"
+#include "uint256.h"
 
-// secp160k1
-// const unsigned int PRIVATE_KEY_SIZE = 192;
-// const unsigned int PUBLIC_KEY_SIZE  = 41;
-// const unsigned int SIGNATURE_SIZE   = 48;
-//
-// secp192k1
-// const unsigned int PRIVATE_KEY_SIZE = 222;
-// const unsigned int PUBLIC_KEY_SIZE  = 49;
-// const unsigned int SIGNATURE_SIZE   = 57;
-//
-// secp224k1
-// const unsigned int PRIVATE_KEY_SIZE = 250;
-// const unsigned int PUBLIC_KEY_SIZE  = 57;
-// const unsigned int SIGNATURE_SIZE   = 66;
-//
-// secp256k1:
-// const unsigned int PRIVATE_KEY_SIZE = 279;
-// const unsigned int PUBLIC_KEY_SIZE  = 65;
-// const unsigned int SIGNATURE_SIZE   = 72;
-//
-// see www.keylength.com
-// script supports up to 75 for single byte push
+#include <stdexcept>
+#include <vector>
 
 
+/** 
+ * secp256k1:
+ * const unsigned int PRIVATE_KEY_SIZE = 279;
+ * const unsigned int PUBLIC_KEY_SIZE  = 65;
+ * const unsigned int SIGNATURE_SIZE   = 72;
+ *
+ * see www.keylength.com
+ * script supports up to 75 for single byte push
+ */
 
-class key_error : public std::runtime_error
-{
-public:
-    explicit key_error(const std::string& str) : std::runtime_error(str) {}
-};
-
-
-// secure_allocator is defined in serialize.h
+/**
+ * secure_allocator is defined in allocators.h
+ * CPrivKey is a serialized private key, with all parameters included (279 bytes)
+ */
 typedef std::vector<unsigned char, secure_allocator<unsigned char> > CPrivKey;
 
-
-
+/** An encapsulated private key. */
 class CKey
 {
-protected:
-    EC_KEY* pkey;
-    bool fSet;
+private:
+    //! Whether this private key is valid. We check for correctness when modifying the key
+    //! data, so fValid should always correspond to the actual state.
+    bool fValid;
+
+    //! Whether the public key corresponding to this private key is (to be) compressed.
+    bool fCompressed;
+
+    //! The actual byte data
+    unsigned char vch[32];
+
+    //! Check whether the 32-byte array pointed to be vch is valid keydata.
+    bool static Check(const unsigned char* vch);
 
 public:
-    CKey()
+    //! Construct an invalid private key.
+    CKey() : fValid(false), fCompressed(false)
     {
-        pkey = EC_KEY_new_by_curve_name(NID_secp256k1);
-        if (pkey == NULL)
-            throw key_error("CKey::CKey() : EC_KEY_new_by_curve_name failed");
-        fSet = false;
+        LockObject(vch);
     }
 
-    CKey(const CKey& b)
+    //! Copy constructor. This is necessary because of memlocking.
+    CKey(const CKey& secret) : fValid(secret.fValid), fCompressed(secret.fCompressed)
     {
-        pkey = EC_KEY_dup(b.pkey);
-        if (pkey == NULL)
-            throw key_error("CKey::CKey(const CKey&) : EC_KEY_dup failed");
-        fSet = b.fSet;
+        LockObject(vch);
+        memcpy(vch, secret.vch, sizeof(vch));
     }
 
-    CKey& operator=(const CKey& b)
-    {
-        if (!EC_KEY_copy(pkey, b.pkey))
-            throw key_error("CKey::operator=(const CKey&) : EC_KEY_copy failed");
-        fSet = b.fSet;
-        return (*this);
-    }
-
+    //! Destructor (again necessary because of memlocking).
     ~CKey()
     {
-        EC_KEY_free(pkey);
+        UnlockObject(vch);
     }
 
-    bool IsNull() const
+    friend bool operator==(const CKey& a, const CKey& b)
     {
-        return !fSet;
+        return a.fCompressed == b.fCompressed && a.size() == b.size() &&
+               memcmp(&a.vch[0], &b.vch[0], a.size()) == 0;
     }
 
-    void MakeNewKey()
+    //! Initialize using begin and end iterators to byte data.
+    template <typename T>
+    void Set(const T pbegin, const T pend, bool fCompressedIn)
     {
-        if (!EC_KEY_generate_key(pkey))
-            throw key_error("CKey::MakeNewKey() : EC_KEY_generate_key failed");
-        fSet = true;
+        if (pend - pbegin != 32) {
+            fValid = false;
+            return;
+        }
+        if (Check(&pbegin[0])) {
+            memcpy(vch, (unsigned char*)&pbegin[0], 32);
+            fValid = true;
+            fCompressed = fCompressedIn;
+        } else {
+            fValid = false;
+        }
     }
 
-    bool SetPrivKey(const CPrivKey& vchPrivKey)
+    //! Simple read-only vector-like interface.
+    unsigned int size() const { return (fValid ? 32 : 0); }
+    const unsigned char* begin() const { return vch; }
+    const unsigned char* end() const { return vch + size(); }
+
+    //! Check whether this private key is valid.
+    bool IsValid() const { return fValid; }
+
+    //! Check whether the public key corresponding to this private key is (to be) compressed.
+    bool IsCompressed() const { return fCompressed; }
+
+    //! Initialize from a CPrivKey (serialized OpenSSL private key data).
+    bool SetPrivKey(const CPrivKey& vchPrivKey, bool fCompressed);
+
+    //! Generate a new private key using a cryptographic PRNG.
+    void MakeNewKey(bool fCompressed);
+
+    /**
+     * Convert the private key to a CPrivKey (serialized OpenSSL private key data).
+     * This is expensive. 
+     */
+    CPrivKey GetPrivKey() const;
+
+    /**
+     * Compute the public key from a private key.
+     * This is expensive.
+     */
+    CPubKey GetPubKey() const;
+
+    /**
+     * Create a DER-serialized signature.
+     * The test_case parameter tweaks the deterministic nonce.
+     */
+    bool Sign(const uint256& hash, std::vector<unsigned char>& vchSig, uint32_t test_case = 0) const;
+
+    /**
+     * Create a compact signature (65 bytes), which allows reconstructing the used public key.
+     * The format is one header byte, followed by two times 32 bytes for the serialized r and s values.
+     * The header byte: 0x1B = first key with even y, 0x1C = first key with odd y,
+     *                  0x1D = second key with even y, 0x1E = second key with odd y,
+     *                  add 0x04 for compressed keys.
+     */
+    bool SignCompact(const uint256& hash, std::vector<unsigned char>& vchSig) const;
+
+    //! Derive BIP32 child key.
+    bool Derive(CKey& keyChild, ChainCode &ccChild, unsigned int nChild, const ChainCode& cc) const;
+
+    /**
+     * Verify thoroughly whether a private key and a public key match.
+     * This is done using a different mechanism than just regenerating it.
+     */
+    bool VerifyPubKey(const CPubKey& vchPubKey) const;
+
+    //! Load private key and check that public key matches.
+    bool Load(CPrivKey& privkey, CPubKey& vchPubKey, bool fSkipCheck);
+
+    //! Check whether an element of a signature (r or s) is valid.
+    static bool CheckSignatureElement(const unsigned char* vch, int len, bool half);
+};
+
+struct CExtKey {
+    unsigned char nDepth;
+    unsigned char vchFingerprint[4];
+    unsigned int nChild;
+    ChainCode chaincode;
+    CKey key;
+
+    friend bool operator==(const CExtKey& a, const CExtKey& b)
     {
-        const unsigned char* pbegin = &vchPrivKey[0];
-        if (!d2i_ECPrivateKey(&pkey, &pbegin, vchPrivKey.size()))
-            return false;
-        fSet = true;
-        return true;
+        return a.nDepth == b.nDepth && memcmp(&a.vchFingerprint[0], &b.vchFingerprint[0], 4) == 0 && a.nChild == b.nChild &&
+               a.chaincode == b.chaincode && a.key == b.key;
     }
 
-    CPrivKey GetPrivKey() const
+    void Encode(unsigned char code[BIP32_EXTKEY_SIZE]) const;
+    void Decode(const unsigned char code[BIP32_EXTKEY_SIZE]);
+    bool Derive(CExtKey& out, unsigned int nChild) const;
+    CExtPubKey Neuter() const;
+    void SetMaster(const unsigned char* seed, unsigned int nSeedLen);
+    template <typename Stream>
+    void Serialize(Stream& s, int nType, int nVersion) const
     {
-        unsigned int nSize = i2d_ECPrivateKey(pkey, NULL);
-        if (!nSize)
-            throw key_error("CKey::GetPrivKey() : i2d_ECPrivateKey failed");
-        CPrivKey vchPrivKey(nSize, 0);
-        unsigned char* pbegin = &vchPrivKey[0];
-        if (i2d_ECPrivateKey(pkey, &pbegin) != nSize)
-            throw key_error("CKey::GetPrivKey() : i2d_ECPrivateKey returned unexpected size");
-        return vchPrivKey;
+        unsigned int len = BIP32_EXTKEY_SIZE;
+        ::WriteCompactSize(s, len);
+        unsigned char code[BIP32_EXTKEY_SIZE];
+        Encode(code);
+        s.write((const char *)&code[0], len);
     }
-
-    bool SetPubKey(const std::vector<unsigned char>& vchPubKey)
+    template <typename Stream>
+    void Unserialize(Stream& s, int nType, int nVersion)
     {
-        const unsigned char* pbegin = &vchPubKey[0];
-        if (!o2i_ECPublicKey(&pkey, &pbegin, vchPubKey.size()))
-            return false;
-        fSet = true;
-        return true;
-    }
-
-    std::vector<unsigned char> GetPubKey() const
-    {
-        unsigned int nSize = i2o_ECPublicKey(pkey, NULL);
-        if (!nSize)
-            throw key_error("CKey::GetPubKey() : i2o_ECPublicKey failed");
-        std::vector<unsigned char> vchPubKey(nSize, 0);
-        unsigned char* pbegin = &vchPubKey[0];
-        if (i2o_ECPublicKey(pkey, &pbegin) != nSize)
-            throw key_error("CKey::GetPubKey() : i2o_ECPublicKey returned unexpected size");
-        return vchPubKey;
-    }
-
-    bool Sign(uint256 hash, std::vector<unsigned char>& vchSig)
-    {
-        vchSig.clear();
-        unsigned char pchSig[10000];
-        unsigned int nSize = 0;
-        if (!ECDSA_sign(0, (unsigned char*)&hash, sizeof(hash), pchSig, &nSize, pkey))
-            return false;
-        vchSig.resize(nSize);
-        memcpy(&vchSig[0], pchSig, nSize);
-        return true;
-    }
-
-    bool Verify(uint256 hash, const std::vector<unsigned char>& vchSig)
-    {
-        // -1 = error, 0 = bad sig, 1 = good
-        if (ECDSA_verify(0, (unsigned char*)&hash, sizeof(hash), &vchSig[0], vchSig.size(), pkey) != 1)
-            return false;
-        return true;
-    }
-
-    static bool Sign(const CPrivKey& vchPrivKey, uint256 hash, std::vector<unsigned char>& vchSig)
-    {
-        CKey key;
-        if (!key.SetPrivKey(vchPrivKey))
-            return false;
-        return key.Sign(hash, vchSig);
-    }
-
-    static bool Verify(const std::vector<unsigned char>& vchPubKey, uint256 hash, const std::vector<unsigned char>& vchSig)
-    {
-        CKey key;
-        if (!key.SetPubKey(vchPubKey))
-            return false;
-        return key.Verify(hash, vchSig);
+        unsigned int len = ::ReadCompactSize(s);
+        unsigned char code[BIP32_EXTKEY_SIZE];
+        s.read((char *)&code[0], len);
+        Decode(code);
     }
 };
 
-#endif
+/** Initialize the elliptic curve support. May not be called twice without calling ECC_Stop first. */
+void ECC_Start(void);
+
+/** Deinitialize the elliptic curve support. No-op if ECC_Start wasn't called first. */
+void ECC_Stop(void);
+
+/** Check that required EC support is available at runtime. */
+bool ECC_InitSanityCheck(void);
+
+#endif // BITCOIN_KEY_H
